@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"strings"
+	"sync"
 
 	log "github.com/sirupsen/logrus"
 
@@ -31,9 +32,13 @@ var (
 )
 
 type fileConfigurator struct {
-	repair              *repair
+	repair         *repair
+	nbNameserverIP netip.Addr
+
+	// mu guards originalPerms and originalNameservers, written both from applyDNSConfig/restoreHostDNS
+	// and from the repair watcher goroutine whenever something external rewrites resolv.conf.
+	mu                  sync.Mutex
 	originalPerms       os.FileMode
-	nbNameserverIP      netip.Addr
 	originalNameservers []netip.Addr
 }
 
@@ -48,38 +53,81 @@ func (f *fileConfigurator) supportCustomPort() bool {
 }
 
 func (f *fileConfigurator) applyDNSConfig(config HostDNSConfig, stateManager *statemanager.Manager) error {
-	if !f.isBackupFileExist() {
-		if err := f.backup(); err != nil {
-			return fmt.Errorf("backup resolv.conf: %w", err)
-		}
-	}
-
 	nbSearchDomains := searchDomains(config)
 	f.nbNameserverIP = config.ServerIP
 
-	resolvConf, err := parseBackupResolvConf()
+	cfg, err := f.loadOriginalResolvConf()
 	if err != nil {
-		log.Errorf("could not read original search domains from %s: %s", fileDefaultResolvConfBackupLocation, err)
+		log.Errorf("could not determine original resolv.conf state: %s", err)
 	}
-
-	f.originalNameservers = resolvConf.nameServers
 
 	f.repair.stopWatchFileChanges()
 
-	err = f.updateConfig(nbSearchDomains, f.nbNameserverIP, resolvConf, stateManager)
-	if err != nil {
+	if err := f.updateConfig(nbSearchDomains, f.nbNameserverIP, cfg, stateManager); err != nil {
 		return err
 	}
 	f.repair.watchFileChanges(nbSearchDomains, f.nbNameserverIP, stateManager)
 	return nil
 }
 
-// getOriginalNameservers returns the nameservers that were found in the original resolv.conf
+// loadOriginalResolvConf returns the pre-NetBird resolv.conf state: the live file when NetBird
+// isn't currently managing it, or the last known backup when a previous run left the file in a
+// managed state (e.g. after an unclean shutdown), so a leftover NetBird header is never mistaken
+// for the original configuration.
+func (f *fileConfigurator) loadOriginalResolvConf() (*resolvConf, error) {
+	managed, err := isNetBirdManagedFile(defaultResolvConfPath)
+	if err != nil {
+		return &resolvConf{}, fmt.Errorf("check %s: %w", defaultResolvConfPath, err)
+	}
+	if !managed {
+		return parseDefaultResolvConf()
+	}
+
+	if !f.isBackupFileExist() {
+		return &resolvConf{}, nil
+	}
+	return parseBackupResolvConf()
+}
+
+// getOriginalNameservers returns the nameservers that were found in the original resolv.conf.
 func (f *fileConfigurator) getOriginalNameservers() []netip.Addr {
-	return f.originalNameservers
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]netip.Addr(nil), f.originalNameservers...)
+}
+
+func (f *fileConfigurator) setOriginalNameservers(nameServers []netip.Addr) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.originalNameservers = nameServers
+}
+
+func (f *fileConfigurator) setOriginalPerms(perms os.FileMode) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.originalPerms = perms
+}
+
+// getOriginalPerms returns the permissions recorded for the pre-NetBird resolv.conf, falling back
+// to a sane default when nothing was ever recorded, e.g. because no file previously existed.
+func (f *fileConfigurator) getOriginalPerms() os.FileMode {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.originalPerms == 0 {
+		return 0o644
+	}
+	return f.originalPerms
 }
 
 func (f *fileConfigurator) updateConfig(nbSearchDomains []string, nbNameserverIP netip.Addr, cfg *resolvConf, stateManager *statemanager.Manager) error {
+	// Best-effort: refresh the pre-NetBird snapshot from the live file before overwriting it, so a
+	// restore after a network change restores the network that was actually active, not a stale
+	// snapshot from a previous one. A failure here must not block applying the DNS config.
+	if err := f.refreshBackup(); err != nil {
+		log.Warnf("failed to refresh resolv.conf backup: %s", err)
+	}
+	f.setOriginalNameservers(cfg.nameServers)
+
 	searchDomainList := mergeSearchDomains(nbSearchDomains, cfg.searchDomains)
 
 	buf := prepareResolvConfContent(
@@ -89,7 +137,7 @@ func (f *fileConfigurator) updateConfig(nbSearchDomains []string, nbNameserverIP
 	)
 
 	log.Debugf("creating managed file %s", defaultResolvConfPath)
-	err := os.WriteFile(defaultResolvConfPath, buf.Bytes(), f.originalPerms)
+	err := os.WriteFile(defaultResolvConfPath, buf.Bytes(), f.getOriginalPerms())
 	if err != nil {
 		restoreErr := f.restore()
 		if restoreErr != nil {
@@ -123,16 +171,48 @@ func (f *fileConfigurator) backup() error {
 		return fmt.Errorf("checking stats for %s file. Error: %w", defaultResolvConfPath, err)
 	}
 
-	f.originalPerms = stats.Mode()
+	f.setOriginalPerms(stats.Mode())
 
-	err = copyFile(defaultResolvConfPath, fileDefaultResolvConfBackupLocation)
-	if err != nil {
+	if err := copyFile(defaultResolvConfPath, fileDefaultResolvConfBackupLocation); err != nil {
 		return fmt.Errorf("backing up %s: %w", defaultResolvConfPath, err)
 	}
 	return nil
 }
 
+// refreshBackup snapshots the current resolv.conf as the pre-NetBird state, unless NetBird is
+// already the one that wrote it - in which case the existing backup already holds the correct
+// snapshot and must not be overwritten with NetBird's own content.
+func (f *fileConfigurator) refreshBackup() error {
+	managed, err := isNetBirdManagedFile(defaultResolvConfPath)
+	if err != nil {
+		return fmt.Errorf("check %s: %w", defaultResolvConfPath, err)
+	}
+	if managed {
+		return nil
+	}
+	return f.backup()
+}
+
+// isNetBirdManagedFile reports whether path currently holds NetBird-generated content, so callers
+// can tell a genuine pre-NetBird resolv.conf from a leftover NetBird-managed one, e.g. after an
+// unclean shutdown.
+func isNetBirdManagedFile(path string) (bool, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read %s: %w", path, err)
+	}
+	return bytes.Contains(content, []byte(fileGeneratedResolvConfContentHeader)), nil
+}
+
 func (f *fileConfigurator) restore() error {
+	if !f.isBackupFileExist() {
+		log.Warnf("no resolv.conf backup found, removing NetBird-managed %s instead of restoring", defaultResolvConfPath)
+		return os.RemoveAll(defaultResolvConfPath)
+	}
+
 	if err := copyFile(fileDefaultResolvConfBackupLocation, defaultResolvConfPath); err != nil {
 		return fmt.Errorf("restoring %s from %s: %w", defaultResolvConfPath, fileDefaultResolvConfBackupLocation, err)
 	}
