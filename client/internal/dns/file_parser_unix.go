@@ -12,9 +12,12 @@ import (
 )
 
 const (
-	defaultResolvConfPath = "/etc/resolv.conf"
-	nsswitchConfPath      = "/etc/nsswitch.conf"
+	nsswitchConfPath = "/etc/nsswitch.conf"
 )
+
+// defaultResolvConfPath is a var rather than a const so tests can point it at a temporary file
+// instead of the real /etc/resolv.conf.
+var defaultResolvConfPath = "/etc/resolv.conf"
 
 type resolvConf struct {
 	nameServers   []netip.Addr
